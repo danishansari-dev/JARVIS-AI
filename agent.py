@@ -115,15 +115,19 @@ USER PREFERENCES:
         messages = [{"role": "system", "content": system_prompt}]
         messages += self.buffer.to_messages()
 
-        response = self.groq_client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            tools=tools_groq,
-            tool_choice="auto",
-            max_tokens=1024,
-            temperature=0.3,
-            timeout=15.0
-        )
+        try:
+            response = self.groq_client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                tools=tools_groq,
+                tool_choice="auto",
+                max_tokens=1024,
+                temperature=0.3,
+                timeout=15.0
+            )
+        except Exception as e:
+            logger.error(f"Groq API Error: {e}")
+            return f"I encountered an error predicting a response: {e}"
 
         for _ in range(5):
             message = response.choices[0].message
@@ -156,15 +160,19 @@ USER PREFERENCES:
                     "content": str(result)
                 })
             
-            response = self.groq_client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                tools=tools_groq,
-                tool_choice="auto",
-                max_tokens=1024,
-                temperature=0.3,
-                timeout=15.0
-            )
+            try:
+                response = self.groq_client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    tools=tools_groq,
+                    tool_choice="auto",
+                    max_tokens=1024,
+                    temperature=0.3,
+                    timeout=15.0
+                )
+            except Exception as e:
+                logger.error(f"Groq API Error during tool resolution: {e}")
+                return "I encountered an error trying to process that tool."
 
         final_text = response.choices[0].message.content or "Done."
         self.buffer.add_turn("jarvis", final_text)
