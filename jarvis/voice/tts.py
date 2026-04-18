@@ -1,232 +1,181 @@
-"""ElevenLabs streaming TTS with Piper fallback, queued sentence playback, and monthly usage tracking."""
+"""Hybrid TTS engine: Piper for short prompts, ElevenLabs for longer prompts."""
 
 from __future__ import annotations
 
-import asyncio
 import io
 import logging
-import re
+import os
+import queue
 import shutil
 import subprocess
 import tempfile
-import wave
+import threading
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
-import httpx
-import numpy as np
-import sounddevice as sd
+import pygame
+import requests
 
-from jarvis.config import Settings
-from jarvis.memory.db import log_elevenlabs_usage
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional dependency
+    load_dotenv = None
 
 logger = logging.getLogger(__name__)
 
-WARN_CHARS_SOFT = 8_000
-WARN_CHARS_HARD = 10_000
 
-_ELEVENLABS_PCM_RATES: dict[str, int] = {
-    "pcm_8000": 8000,
-    "pcm_16000": 16_000,
-    "pcm_22050": 22_050,
-    "pcm_24000": 24_000,
-    "pcm_44100": 44_100,
-    "pcm_48000": 48_000,
-}
+@dataclass(slots=True)
+class _SpeakRequest:
+    text: str
+    force_local: bool
+    done: threading.Event | None
 
 
-def _split_for_tts(text: str) -> list[str]:
-    text = text.strip()
-    if not text:
-        return []
-    parts = re.split(r"(?<=[.!?…])\s+|\n+", text)
-    chunks = [p.strip() for p in parts if p.strip()]
-    return chunks if chunks else [text]
+class TTSEngine:
+    """Route TTS between local Piper and ElevenLabs streaming."""
 
+    def __init__(self) -> None:
+        if load_dotenv is not None:
+            load_dotenv()
+        self.api_key: str = os.getenv("ELEVENLABS_API_KEY", "").strip()
+        self.voice_id: str = os.getenv("ELEVENLABS_VOICE_ID", "").strip()
+        self.model_id: str = os.getenv("ELEVENLABS_MODEL_ID", "eleven_turbo_v2_5").strip()
+        self.output_format: str = os.getenv("ELEVENLABS_OUTPUT_FORMAT", "pcm_22050").strip()
+        self.piper_model_path: str = os.getenv("PIPER_MODEL_PATH", "").strip()
+        self._queue: queue.Queue[_SpeakRequest | None] = queue.Queue()
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True, name="tts-worker")
+        self._running = True
 
-def _is_acknowledgement(text: str) -> bool:
-    """Route short confirmations to Piper to conserve ElevenLabs quota."""
-    key = " ".join(re.findall(r"[A-Za-z']+", text.strip().lower()))
-    return key in {"done", "opening", "got it"}
+        pygame.mixer.init()
+        self._worker.start()
 
-
-def _maybe_warn_elevenlabs(prev: int, new_total: int) -> None:
-    if prev < WARN_CHARS_SOFT <= new_total:
-        logger.warning(
-            "ElevenLabs monthly characters crossed %d (now %d / soft cap %d)",
-            WARN_CHARS_SOFT,
-            new_total,
-            WARN_CHARS_SOFT,
-        )
-    if prev < WARN_CHARS_HARD <= new_total:
-        logger.warning(
-            "ElevenLabs monthly characters crossed %d (now %d / hard cap %d)",
-            WARN_CHARS_HARD,
-            new_total,
-            WARN_CHARS_HARD,
-        )
-    if new_total >= WARN_CHARS_HARD:
-        logger.warning(
-            "ElevenLabs monthly usage at or above %d characters (%d). Consider switching to Piper.",
-            WARN_CHARS_HARD,
-            new_total,
-        )
-
-
-class TextToSpeech:
-    """Sentence-queue TTS: ElevenLabs HTTP streaming primary, Piper offline fallback."""
-
-    def __init__(self, settings: Settings) -> None:
-        self._settings = settings
-        self._http: httpx.AsyncClient | None = None
-
-    async def start(self) -> None:
-        self._http = httpx.AsyncClient(timeout=120.0)
-
-    async def stop(self) -> None:
-        if self._http is not None:
-            await self._http.aclose()
-            self._http = None
-
-    async def speak(self, text: str) -> None:
-        if not text.strip():
+    def speak(self, text: str, force_local: bool = False) -> None:
+        """Queue speech synthesis and return immediately."""
+        cleaned = text.strip()
+        if not cleaned:
             return
-        if self._http is None:
-            raise RuntimeError("TextToSpeech.start() must be awaited before speak()")
-        sentences = _split_for_tts(text)
-        if not sentences:
-            return
-        queue: asyncio.Queue[tuple[bytes, int] | None] = asyncio.Queue(maxsize=4)
+        self._queue.put(_SpeakRequest(text=cleaned, force_local=force_local, done=None))
 
-        async def producer() -> None:
+    def speak_sync(self, text: str) -> None:
+        """Queue synthesis and block until playback finishes."""
+        cleaned = text.strip()
+        if not cleaned:
+            return
+        done = threading.Event()
+        self._queue.put(_SpeakRequest(text=cleaned, force_local=False, done=done))
+        done.wait()
+
+    def _worker_loop(self) -> None:
+        while self._running:
+            item = self._queue.get()
+            if item is None:
+                break
             try:
-                for sentence in sentences:
-                    try:
-                        pcm, sr = await self._synthesize_sentence(sentence)
-                    except Exception:
-                        logger.exception("Sentence synthesis failed (%s)", sentence[:80])
-                        continue
-                    await queue.put((pcm, sr))
+                self._speak_impl(item.text, item.force_local)
+            except Exception:
+                logger.exception("TTS playback failed")
             finally:
-                await queue.put(None)
+                if item.done is not None:
+                    item.done.set()
 
-        async def consumer() -> None:
-            while True:
-                item = await queue.get()
-                if item is None:
-                    break
-                pcm, sr = item
-                await asyncio.to_thread(self._play_pcm_blocking, pcm, sr)
+    def _speak_impl(self, text: str, force_local: bool) -> None:
+        words = len(text.split())
+        use_local = force_local or words <= 6
+        if use_local:
+            logger.info("Using Piper TTS (%d words)", words)
+            audio_bytes = self._synthesize_with_piper(text)
+            suffix = ".wav"
+        else:
+            logger.info("Using ElevenLabs streaming TTS (%d words)", words)
+            try:
+                audio_bytes = self._synthesize_with_elevenlabs(text)
+                self._track_usage(len(text))
+                suffix = ".mp3"
+            except Exception as e:
+                logger.warning("ElevenLabs TTS failed: %s. Falling back to Piper.", e)
+                audio_bytes = self._synthesize_with_piper(text)
+                suffix = ".wav"
+        self._play_audio_bytes(audio_bytes, suffix=suffix)
 
-        await asyncio.gather(producer(), consumer())
-
-    async def _synthesize_sentence(self, sentence: str) -> tuple[bytes, int]:
-        if _is_acknowledgement(sentence):
-            return await asyncio.to_thread(self._piper_to_pcm, sentence)
-        key = self._settings.elevenlabs_api_key.strip()
-        voice = self._settings.elevenlabs_voice_id.strip()
-        if not key or not voice:
-            return await asyncio.to_thread(self._piper_to_pcm, sentence)
-        try:
-            pcm = await self._elevenlabs_sentence_pcm(sentence)
-            prev, new_total = await asyncio.to_thread(
-                log_elevenlabs_usage,
-                self._settings.profile_db_path,
-                len(sentence),
-            )
-            _maybe_warn_elevenlabs(prev, new_total)
-            rate = _ELEVENLABS_PCM_RATES.get(
-                self._settings.elevenlabs_output_format,
-                22_050,
-            )
-            return pcm, rate
-        except Exception as exc:
-            msg = str(exc).lower()
-            if "429" in msg or "quota" in msg or "402" in msg:
-                logger.warning("ElevenLabs unavailable (%s); falling back to Piper", exc)
-            else:
-                logger.warning("ElevenLabs request failed (%s); falling back to Piper", exc)
-            return await asyncio.to_thread(self._piper_to_pcm, sentence)
-
-    async def _elevenlabs_sentence_pcm(self, sentence: str) -> bytes:
-        assert self._http is not None
-        voice_id = self._settings.elevenlabs_voice_id
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
-        params = {
-            "output_format": self._settings.elevenlabs_output_format,
-        }
+    def _synthesize_with_elevenlabs(self, text: str) -> bytes:
+        if not self.api_key:
+            raise RuntimeError("ELEVENLABS_API_KEY is required for cloud TTS")
+        if not self.voice_id:
+            raise RuntimeError("ELEVENLABS_VOICE_ID is required for cloud TTS")
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{self.voice_id}/stream"
         headers = {
-            "xi-api-key": self._settings.elevenlabs_api_key,
-            "Accept": "application/octet-stream",
+            "xi-api-key": self.api_key,
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg",
         }
         payload = {
-            "text": sentence,
-            "model_id": self._settings.elevenlabs_model_id,
+            "text": text,
+            "model_id": self.model_id,
+            "output_format": self.output_format,
         }
-        async with self._http.stream(
-            "POST",
-            url,
-            params=params,
-            json=payload,
-            headers=headers,
-        ) as resp:
-            if resp.status_code in (401, 402, 403, 429):
-                detail = (await resp.aread())[:400]
-                raise RuntimeError(f"elevenlabs_http_{resp.status_code}:{detail!r}")
-            resp.raise_for_status()
-            buffer = bytearray()
-            async for chunk in resp.aiter_bytes():
-                buffer.extend(chunk)
-        return bytes(buffer)
+        response = requests.post(url, headers=headers, json=payload, timeout=60, stream=True)
+        response.raise_for_status()
+        output = io.BytesIO()
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                output.write(chunk)
+        return output.getvalue()
 
-    def _piper_to_pcm(self, text: str) -> tuple[bytes, int]:
-        model = self._settings.piper_model_path
-        exe = self._settings.piper_executable
-        if model is None or not Path(model).is_file():
-            raise RuntimeError("Piper model missing; configure PIPER_MODEL_PATH for offline TTS")
-        piper_bin = Path(exe) if Path(exe).is_file() else Path(shutil.which(str(exe)) or exe)
-        if not piper_bin.is_file() and shutil.which(str(exe)) is None:
-            raise FileNotFoundError(str(exe))
+    def _synthesize_with_piper(self, text: str) -> bytes:
+        model_path = Path(self.piper_model_path)
+        if not model_path.is_file():
+            raise RuntimeError("PIPER_MODEL_PATH must point to a valid .onnx model file")
+        piper_bin = shutil.which("piper") or shutil.which("piper.exe")
+        if piper_bin is None:
+            raise RuntimeError("Piper executable not found on PATH")
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             out_path = Path(tmp.name)
-
         try:
-            completed = subprocess.run(
-                [
-                    str(piper_bin),
-                    "--model",
-                    str(model),
-                    "--output_file",
-                    str(out_path),
-                ],
+            proc = subprocess.run(
+                [piper_bin, "--model", str(model_path), "--output_file", str(out_path)],
                 input=text.encode("utf-8"),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 check=False,
             )
-            if completed.returncode != 0:
-                err = (completed.stderr or b"").decode("utf-8", errors="replace")
-                raise RuntimeError(err)
-            wav_bytes = out_path.read_bytes()
+            if proc.returncode != 0:
+                stderr_text = proc.stderr.decode("utf-8", errors="replace")
+                raise RuntimeError(f"Piper synthesis failed: {stderr_text}")
+            return out_path.read_bytes()
         finally:
-            try:
-                out_path.unlink(missing_ok=True)
-            except OSError:
-                logger.debug("Could not remove Piper temp wav", exc_info=True)
+            out_path.unlink(missing_ok=True)
 
-        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
-            if wf.getsampwidth() != 2:
-                raise ValueError("Piper must output 16-bit WAV")
-            sr = wf.getframerate()
-            ch = wf.getnchannels()
-            frames = wf.readframes(wf.getnframes())
-        pcm = np.frombuffer(frames, dtype=np.int16)
-        if ch > 1:
-            pcm = pcm.reshape(-1, ch)[:, 0]
-        return pcm.tobytes(), int(sr)
+    def _play_audio_bytes(self, audio_bytes: bytes, suffix: str) -> None:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            temp_path = Path(tmp.name)
+            temp_path.write_bytes(audio_bytes)
+        try:
+            pygame.mixer.music.load(str(temp_path))
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy():
+                time.sleep(0.05)
+        finally:
+            # On Windows the mixer can keep a handle open briefly after playback.
+            pygame.mixer.music.stop()
+            unload = getattr(pygame.mixer.music, "unload", None)
+            if callable(unload):
+                unload()
+            for _ in range(10):
+                try:
+                    temp_path.unlink(missing_ok=True)
+                    break
+                except PermissionError:
+                    time.sleep(0.05)
 
-    def _play_pcm_blocking(self, pcm: bytes, sample_rate: int) -> None:
-        if not pcm:
-            return
-        audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-        sd.play(audio, sample_rate, blocking=True)
+    def _track_usage(self, chars: int) -> None:
+        from main_api import log_elevenlabs_usage
+
+        log_elevenlabs_usage(chars)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    tts = TTSEngine()
+    tts.speak_sync("JARVIS online. All systems nominal.")
