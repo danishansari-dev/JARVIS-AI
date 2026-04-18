@@ -9,6 +9,7 @@ try:
     from ctypes import cast, POINTER
     from comtypes import CLSCTX_ALL
     import screen_brightness_control as sbc
+    import pythoncom
 except ImportError:
     pass
 
@@ -23,6 +24,7 @@ def _system_control(data: SystemControlInput) -> str:
         if data.value is None:
             return "Volume value required."
         try:
+            pythoncom.CoInitialize()
             devices = AudioUtilities.GetSpeakers()
             interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
             volume = cast(interface, POINTER(IAudioEndpointVolume))
@@ -34,6 +36,7 @@ def _system_control(data: SystemControlInput) -> str:
             
     elif action == "get_volume":
         try:
+            pythoncom.CoInitialize()
             devices = AudioUtilities.GetSpeakers()
             interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
             volume = cast(interface, POINTER(IAudioEndpointVolume))
