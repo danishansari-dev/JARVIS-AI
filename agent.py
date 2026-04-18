@@ -121,7 +121,8 @@ USER PREFERENCES:
             tools=tools_groq,
             tool_choice="auto",
             max_tokens=1024,
-            temperature=0.3
+            temperature=0.3,
+            timeout=15.0
         )
 
         for _ in range(5):
@@ -161,7 +162,8 @@ USER PREFERENCES:
                 tools=tools_groq,
                 tool_choice="auto",
                 max_tokens=1024,
-                temperature=0.3
+                temperature=0.3,
+                timeout=15.0
             )
 
         final_text = response.choices[0].message.content or "Done."
