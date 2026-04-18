@@ -1,0 +1,18 @@
+# Legacy Vite UI (superseded by `dashboard/`); ignore remnants if tooling locks native binaries.
+/web/
+
+# Dashboard frontend
+dashboard/node_modules/
+dashboard/dist/
+dashboard/.env
+
+# Local app data & secrets
+jarvis/data/
+data/
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+.venv/
